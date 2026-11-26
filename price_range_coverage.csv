@@ -1,0 +1,15 @@
+crop,months,pairs,tested,inside,coverage_pct,naive_mape_pct,note
+apple,60,56,12,12,100,15.4,
+banana,47,37,12,10,83,18.6,
+blackgram,60,56,12,7,58,6.7,
+coconut,59,55,12,8,67,17.5,
+cotton,60,56,12,12,100,11.5,
+grapes,45,34,12,10,83,17.7,
+maize,61,57,12,10,83,5.6,
+mango,35,21,0,0,,,"below minimum, no range shown"
+muskmelon,46,36,12,10,83,24.0,
+orange,55,46,12,11,92,37.5,
+paddy,61,57,12,9,75,6.8,
+papaya,51,43,12,4,33,48.3,
+pomegranate,60,56,12,11,92,26.9,
+watermelon,46,35,12,11,92,28.2,

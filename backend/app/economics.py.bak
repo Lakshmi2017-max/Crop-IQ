@@ -1,0 +1,167 @@
+"""Historical price range and per-acre profit engine for CropIQ."""
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+from app.schemas import CropEconomics
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+PRICES_DIR = BACKEND_DIR / "data" / "prices"
+ECONOMICS_CSV = BACKEND_DIR / "data" / "crop_economics.csv"
+
+# Map ML dataset crop names to price/economics file names where they differ.
+CROP_ECONOMICS_ALIASES = {
+    "rice": "paddy",
+}
+
+HORIZON_MONTHS = 4
+
+
+def resolve_crop_economics_key(crop: str) -> str:
+    """Resolve an ML crop label to its price/economics lookup key."""
+    normalized = crop.strip().lower()
+    return CROP_ECONOMICS_ALIASES.get(normalized, normalized)
+
+
+def _parse_optional_float(raw_value: object) -> float | None:
+    """Parse a CSV cell into float, returning None for TODO_SOURCE or empty cells."""
+    if raw_value is None or pd.isna(raw_value):
+        return None
+    text = str(raw_value).strip()
+    if not text or text.upper() == "TODO_SOURCE":
+        return None
+    return float(text)
+
+
+def load_crop_economics_table(econ_csv_path: Path = ECONOMICS_CSV) -> dict[str, dict]:
+    """Load per-crop yield and cultivation cost rows from crop_economics.csv."""
+    if not econ_csv_path.exists():
+        return {}
+
+    df = pd.read_csv(econ_csv_path)
+    table: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        crop_key = str(row["crop"]).strip().lower()
+        source_val = str(row.get("source", "TODO_SOURCE")).strip()
+        year_val = str(row.get("year", "TODO_SOURCE")).strip()
+        table[crop_key] = {
+            "yield_quintal_per_acre": _parse_optional_float(row.get("yield_quintal_per_acre")),
+            "cost_rs_per_acre": _parse_optional_float(row.get("cost_rs_per_acre")),
+            "source": source_val if source_val else "TODO_SOURCE",
+            "year": year_val if year_val else "TODO_SOURCE",
+        }
+    return table
+
+
+def compute_price_range(
+    price_csv_path: Path,
+    horizon_months: int = HORIZON_MONTHS,
+) -> dict | None:
+    """Compute historical H-month log-return 5th-95th percentile price range from MODAL prices.
+
+    Ignores min/max columns because recent Agmarknet rows have inconsistent min/max values.
+    """
+    if not price_csv_path.exists():
+        return None
+
+    df = pd.read_csv(price_csv_path)
+    if "date" not in df.columns or "modal" not in df.columns:
+        return None
+
+    df = df[["date", "modal"]].dropna().copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    prices = df["modal"].astype(float).to_numpy()
+    if len(prices) <= horizon_months + 1:
+        return None
+
+    # Log changes over horizon H months: c_t = ln(price[t + H] / price[t])
+    log_changes = np.log(prices[horizon_months:] / prices[:-horizon_months])
+    q05 = float(np.quantile(log_changes, 0.05))
+    q95 = float(np.quantile(log_changes, 0.95))
+
+    latest_modal = float(prices[-1])
+    price_low = float(latest_modal * np.exp(q05))
+    price_high = float(latest_modal * np.exp(q95))
+
+    return {
+        "price_low": round(price_low, 2),
+        "price_expected": round(latest_modal, 2),
+        "price_high": round(price_high, 2),
+        "price_months_of_history": int(len(prices)),
+    }
+
+
+def _find_price_csv(crop: str, prices_dir: Path) -> Path | None:
+    """Find <crop>.csv or its mapped alias CSV inside prices_dir."""
+    normalized = crop.strip().lower()
+    direct_path = prices_dir / f"{normalized}.csv"
+    if direct_path.exists():
+        return direct_path
+
+    alias_key = resolve_crop_economics_key(normalized)
+    alias_path = prices_dir / f"{alias_key}.csv"
+    if alias_path.exists():
+        return alias_path
+    return None
+
+
+def get_crop_economics(
+    crop: str,
+    prices_dir: Path = PRICES_DIR,
+    econ_table: dict[str, dict] | None = None,
+) -> CropEconomics | None:
+    """Build CropEconomics for a crop if its price file and economics row exist.
+
+    Returns None when either the price file or the crop_economics.csv row is missing.
+    If yield or cost is TODO_SOURCE, returns real price range with null profit values
+    rather than inventing numbers.
+    """
+    if econ_table is None:
+        econ_table = load_crop_economics_table()
+
+    normalized = crop.strip().lower()
+    alias_key = resolve_crop_economics_key(normalized)
+
+    price_csv = _find_price_csv(normalized, prices_dir)
+    econ_row = econ_table.get(normalized) or econ_table.get(alias_key)
+    if price_csv is None or econ_row is None:
+        return None
+
+    price_stats = compute_price_range(price_csv)
+    if price_stats is None:
+        return None
+
+    yield_q = econ_row["yield_quintal_per_acre"]
+    cost_rs = econ_row["cost_rs_per_acre"]
+
+    profit_low: float | None = None
+    profit_expected: float | None = None
+    profit_high: float | None = None
+
+    if yield_q is not None and cost_rs is not None:
+        profit_low = round(yield_q * price_stats["price_low"] - cost_rs, 2)
+        profit_expected = round(yield_q * price_stats["price_expected"] - cost_rs, 2)
+        profit_high = round(yield_q * price_stats["price_high"] - cost_rs, 2)
+
+    raw_source = econ_row["source"]
+    raw_year = econ_row["year"]
+    if raw_source == "TODO_SOURCE":
+        source_label = "CEDA Agmarknet modal prices; yield/cost: TODO_SOURCE"
+    elif raw_year and raw_year != "TODO_SOURCE":
+        source_label = f"CEDA Agmarknet modal prices; {raw_source} ({raw_year})"
+    else:
+        source_label = f"CEDA Agmarknet modal prices; {raw_source}"
+
+    return CropEconomics(
+        price_low=price_stats["price_low"],
+        price_expected=price_stats["price_expected"],
+        price_high=price_stats["price_high"],
+        profit_low=profit_low,
+        profit_expected=profit_expected,
+        profit_high=profit_high,
+        price_months_of_history=price_stats["price_months_of_history"],
+        source=source_label,
+    )
